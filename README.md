@@ -12,7 +12,7 @@ Extract the downloaded file and place the `dataset/` directory in the project ro
 ## Requirements
 
 ### Required Software
-Python 3.9 or higher
+Python 3.9.23 or higher
 
 ### Python Packages
 
