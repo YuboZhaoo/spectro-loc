@@ -1,39 +1,12 @@
 import time
-import random
 import numpy as np
 import matplotlib.pyplot as plt
-from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 from scipy import signal
 import os
 
-SEED = 42
-np.random.seed(SEED)
-random.seed(SEED)
-
-@dataclass
-class DatasetConfig:
-    name: str
-    signal_path: str
-    trigger_path: Optional[str]
-    fs: float
-
-    window: int
-
-    target_length_points: int
-    target_count: int
-
-    noise_std: float = 0.0
-
-    center: float = 1.0
-
-    gate_r_min: float = 0.70
-
-    seed_Q: int = 40
-
-    trigger_threshold: float = 0.5
-
-
+from .config import MotifDatasetConfig
+from .projection import projection_api, apply_view_and_norm
 
 def _znorm_1d(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
@@ -59,7 +32,9 @@ def _center_crop_1d(x: np.ndarray, ratio: float, min_len: int = 16) -> Tuple[np.
     return x[off:off + keep], off
 
 
-def load_data(config: DatasetConfig, rng_seed: int = 42) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+def load_data(config: MotifDatasetConfig, rng_seed: int = 42) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load a mixed-operation trace, normalize it, and optionally add noise."""
+
     if not os.path.exists(config.signal_path):
         raise FileNotFoundError(f"Signal file not found: {config.signal_path}")
 
@@ -134,6 +109,8 @@ def compute_projection_curve(
     agg: str = "l1",
     cutoff_norm: float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Compute the projection curve used to gate candidate motifs."""
+
     window = int(window)
     if window <= 4:
         raise ValueError(f"Invalid window={window}. Must be > 4.")
@@ -150,8 +127,6 @@ def compute_projection_curve(
         "cutoff_norm": float(cutoff_norm),
         "backend": "scipy_stft_fallback",
     }
-    from src.projection import projection_api, apply_view_and_norm  # type: ignore
-
     proj_result = projection_api(
         trace=signal_data,
         method="stft",
@@ -165,11 +140,7 @@ def compute_projection_curve(
     raw_proj = np.asarray(proj_result["proj"], dtype=np.float64)
     t_frames = np.asarray(proj_result.get("t_frames", np.arange(len(raw_proj))), dtype=np.float64)
 
-    try:
-        _, Pz = apply_view_and_norm(t=t_frames, y=raw_proj, normalize="zscore")
-    except Exception:
-        Pz = _znorm_1d(raw_proj)
-
+    _, Pz = apply_view_and_norm(t=t_frames, y=raw_proj, normalize="zscore")
     Pz = np.asarray(Pz, dtype=np.float64)
     meta["backend"] = "projection_api"
     return Pz, t_frames, meta
@@ -183,6 +154,8 @@ def gated_candidates(
     nms_radius: Optional[int] = None,
     max_candidates: int = 2000,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Find candidate motif windows with a projection-energy gate."""
+
     n = int(len(Pz))
     if Lf <= 1 or Lf >= n:
         return np.array([], dtype=int), np.array([], dtype=float), np.array([], dtype=float)
@@ -225,6 +198,8 @@ def choose_template_by_projection(
     Q_seeds: int = 40,
     min_gap: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Select a seed template that produces the strongest repeated hits."""
+
     if len(S) == 0:
         return {"ok": False, "reason": "No candidates."}
     if K <= 0:
@@ -300,6 +275,8 @@ def choose_template_by_projection(
 # 5) Raw NCC match on signal
 # ============================================================
 def raw_ncc_match(signal_data: np.ndarray, template: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute normalized cross-correlation of a raw signal and template."""
+
     x = np.asarray(signal_data, dtype=np.float64)
     t = np.asarray(template, dtype=np.float64)
     m = len(t)
@@ -392,7 +369,11 @@ def compute_hit_rate(
     }
 
 
-def gated_search_pipeline(signal_data: np.ndarray, config: DatasetConfig) -> Dict[str, Any]:
+def gated_search_pipeline(signal_data: np.ndarray, config: MotifDatasetConfig) -> Dict[str, Any]:
+    """Run projection-gated motif localization for one mixed trace."""
+
+    # Compress the trace into a projection curve; the gate and template search
+    # operate in this lower-rate frame domain before raw-signal matching.
     Pz, t_frames, meta = compute_projection_curve(
         signal_data=signal_data,
         fs=config.fs,
@@ -407,6 +388,8 @@ def gated_search_pipeline(signal_data: np.ndarray, config: DatasetConfig) -> Dic
     Lf = int(np.ceil(float(L_samples) / float(hop)))
     Lf = max(Lf, 4)
 
+    # Gate candidate starts by local projection energy. This removes most of
+    # the mixed trace before selecting a representative motif template.
     S, W, E = gated_candidates(
         Pz,
         Lf=Lf,
@@ -422,6 +405,8 @@ def gated_search_pipeline(signal_data: np.ndarray, config: DatasetConfig) -> Dic
             "window_mean": W, "candidates_S": S
         }
 
+    # Choose a seed whose projection segment is similar to many other gated
+    # candidates; this avoids relying on one arbitrary occurrence.
     choose = choose_template_by_projection(
         Pz,
         S=S,
@@ -449,10 +434,14 @@ def gated_search_pipeline(signal_data: np.ndarray, config: DatasetConfig) -> Dic
     end = start + L_samples
     template_full = np.asarray(signal_data[start:end], dtype=np.float64)
 
+    # SHA-256 uses a center crop in the paper experiments to reduce boundary
+    # contamination while still reporting full-length occurrence intervals.
     center_ratio = float(getattr(config, "center", 1.0))
     template_match, match_offset = _center_crop_1d(template_full, ratio=center_ratio, min_len=16)
     match_len = int(len(template_match))
 
+    # Raw NCC provides the final localization score; selected crop positions
+    # are converted back into full-length operation intervals below.
     t_corr, ncc = raw_ncc_match(signal_data, template_match)
     if len(ncc) == 0:
         return {
@@ -504,13 +493,17 @@ def gated_search_pipeline(signal_data: np.ndarray, config: DatasetConfig) -> Dic
     }
 
 
-def analyze(config: DatasetConfig) -> Tuple[Dict[str, Any], np.ndarray, Optional[np.ndarray]]:
+def analyze(config: MotifDatasetConfig) -> Tuple[Dict[str, Any], np.ndarray, Optional[np.ndarray]]:
+    """Load data and run the motif localization pipeline."""
+
     signal_data, trig, _ = load_data(config)
     res = gated_search_pipeline(signal_data, config)
     return res, signal_data, trig
 
 
-def evaluate(config: DatasetConfig, trig: Optional[np.ndarray], res: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate(config: MotifDatasetConfig, trig: Optional[np.ndarray], res: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate motif-localization intervals against trigger ground truth."""
+
     if trig is None:
         return {"ok": False, "reason": "No trigger data."}
     if not res.get("ok", False):
@@ -528,7 +521,9 @@ def evaluate(config: DatasetConfig, trig: Optional[np.ndarray], res: Dict[str, A
     return ev
 
 
-def plot(config: DatasetConfig, signal_data: np.ndarray, trig: Optional[np.ndarray], res: Dict[str, Any]) -> None:
+def plot(config: MotifDatasetConfig, signal_data: np.ndarray, trig: Optional[np.ndarray], res: Dict[str, Any]) -> None:
+    """Plot raw trace, projection candidates, NCC score, and matched kernels."""
+
     ok = bool(res.get("ok", False))
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), constrained_layout=True)
 
@@ -637,13 +632,10 @@ def plot(config: DatasetConfig, signal_data: np.ndarray, trig: Optional[np.ndarr
     plt.show()
 
 
-def save(config: DatasetConfig, res: Dict[str, Any], eval_result: Dict[str, Any], result_dir: str = "./result/sc3_noise_gated") -> Dict[str, Any]:
-    # os.makedirs(result_dir, exist_ok=True)
-    # base = os.path.join(result_dir, config.name)
+def build_summary(config: MotifDatasetConfig, res: Dict[str, Any], eval_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the compact summary consumed by notebook tables."""
 
     if res.get("ok", False):
-        # np.save(base + "_template_full.npy", res["template_full"])
-
         summary = {
             "ok": True,
             "meta": res.get("meta", {}),
@@ -658,6 +650,4 @@ def save(config: DatasetConfig, res: Dict[str, Any], eval_result: Dict[str, Any]
     else:
         summary = {"ok": False, "reason": res.get("reason", "unknown")}
 
-    # np.save(base + "_summary.npy", summary, allow_pickle=True)
     return summary
-

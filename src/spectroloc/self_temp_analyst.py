@@ -3,32 +3,14 @@ from scipy import signal
 from scipy.spatial.distance import cosine
 from scipy.ndimage import label
 import os
-import sys
-import time
-from dataclasses import dataclass, field
-from typing import Tuple, Optional, List, Dict
+from dataclasses import dataclass
+from typing import Tuple, Optional, List, Dict, Sequence
 
-sys.path.append(os.path.abspath(''))
-from src.projection import projection_api, apply_view_and_norm
+from .config import AnalystDatasetConfig
+from .projection import projection_api, apply_view_and_norm
 
-SHARED_WINDOW_LIST = [1000, 5000, 10000, 15000, 20000, 25000, 30000]
-SHARED_PERCENTILE_LIST = [0.1, 1, 2, 4, 6, 8, 10]
-METHOD_COMBINATIONS = [
-    ("stft", "l1"),
-    ("stft", "l2"),
-    ("time", "l1"),
-    ("time", "l2"),
-]
 PRINT_DETAILS = False
 MAX_TEMPLATE_LENGTH_RATIO = 3.0
-
-@dataclass
-class DatasetConfig:
-    name: str
-    signal_path: str
-    trigger_path: str
-    trigger_threshold_raw: float = 190.0
-    noise_std: float = 0.0
 
 @dataclass
 class ExperimentResult:
@@ -42,7 +24,9 @@ class ExperimentResult:
     def accuracy(self) -> float:
         return (self.total_hits / self.total_runs * 100) if self.total_runs > 0 else 0.0
 
-def load_data(config: DatasetConfig) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def load_data(config: AnalystDatasetConfig) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load and normalize one trace and its trigger for analyst-guided search."""
+
     print(f"\nLoading data for dataset: {config.name}...")
     if not os.path.exists(config.signal_path):
         print(f"Error: Signal file not found at '{config.signal_path}'")
@@ -50,10 +34,6 @@ def load_data(config: DatasetConfig) -> Tuple[Optional[np.ndarray], Optional[np.
         
     signal_data = np.load(config.signal_path)
     signal_data = (signal_data - np.mean(signal_data)) / np.std(signal_data)
-    
-    if config.noise_std > 0:
-        noise = np.random.normal(0, config.noise_std, signal_data.shape)
-        signal_data = signal_data + noise
 
     trigger_data = None
     if config.trigger_path and os.path.exists(config.trigger_path):
@@ -65,6 +45,8 @@ def load_data(config: DatasetConfig) -> Tuple[Optional[np.ndarray], Optional[np.
     return signal_data, trigger_data
 
 def get_energy_curve(signal_data: np.ndarray, window: int, method: str, agg: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute the projection curve used to seed template extraction."""
+
     win_len = window
     hop = win_len - int(win_len * 0.25)
     cutoff = 0.05
@@ -101,6 +83,8 @@ def extract_template_coords(
     t_frames: np.ndarray, 
     signal_data: np.ndarray
 ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]]]:
+    """Extract a representative template span from a thresholded projection."""
+
     diffs = np.diff(binary_projection, prepend=0, append=0)
     starts_idx, ends_idx = np.where(diffs == 1)[0], np.where(diffs == -1)[0]
 
@@ -175,10 +159,14 @@ def extract_template_coords(
 def run_single_combination(
     signal_data: np.ndarray, 
     trigger_data: np.ndarray, 
-    config: DatasetConfig,
+    config: AnalystDatasetConfig,
     method: str, 
-    agg: str
+    agg: str,
+    window_list: Sequence[int],
+    percentile_list: Sequence[float],
 ) -> ExperimentResult:
+    """Evaluate one projection method/aggregation pair over an experiment grid."""
+
     hits = 0
     runs = 0
     
@@ -188,21 +176,24 @@ def run_single_combination(
         print(f"     {'Window':<10} | {'Top%':<8} | {'Threshold':<10} | {'Status':<10} | {'Note'}")
         print("     " + "-" * 85)
     
-    for window in SHARED_WINDOW_LIST:
+    for window in window_list:
         try:
+            # Project the raw trace into one energy curve for this window and view.
             vertical_projection, t_frames = get_energy_curve(signal_data, window, method, agg)
         except Exception as e:
             if PRINT_DETAILS:
                 print(f"     {window:<10} | {'ALL':<8} | {'N/A':<10} | ERROR      | Proj Fail: {e}")
-            runs += len(SHARED_PERCENTILE_LIST)
+            runs += len(percentile_list)
             continue
 
-        for top_percentile in SHARED_PERCENTILE_LIST:
+        for top_percentile in percentile_list:
             runs += 1
             
             p_val = 100.0 - top_percentile
             threshold_val = np.percentile(vertical_projection, p_val)
             
+            # Keep only the strongest projected frames, then map the connected
+            # projected region back to raw samples as one candidate template.
             binary_projection = (vertical_projection > threshold_val).astype(int)
             template, coords = extract_template_coords(binary_projection, t_frames, signal_data)
             
@@ -216,6 +207,8 @@ def run_single_combination(
                 trigger_segment = trigger_data[start:safe_end]
                 binary_segment = (trigger_segment > config.trigger_threshold_raw).astype(int)
                 
+                # A valid hit should overlap exactly one ground-truth operation
+                # and should not be much longer than that operation.
                 labeled_array, num_features = label(binary_segment)
                 
                 overlap_len = np.sum(binary_segment)
@@ -243,60 +236,3 @@ def run_single_combination(
                 print(f"     {window:<10} | {top_percentile:<8} | {threshold_val:<10.2f} | {status_str:<10} | {note_str}")
 
     return ExperimentResult(config.name, method, agg, runs, hits)
-
-def run_all_experiments(configs: List[DatasetConfig]):
-    summary_list: List[ExperimentResult] = []
-    
-    for config in configs:
-        signal_data, trigger_data = load_data(config)
-        if signal_data is None:
-            continue
-            
-        print(f"Starting experiments on {config.name} (Total combinations: {len(METHOD_COMBINATIONS)} x {len(SHARED_WINDOW_LIST)} x {len(SHARED_PERCENTILE_LIST)})")
-        
-        for method, agg in METHOD_COMBINATIONS:
-            t0 = time.time()
-            result = run_single_combination(signal_data, trigger_data, config, method, agg)
-            summary_list.append(result)
-            print(f"     Finished {method}-{agg} | Acc: {result.accuracy:.2f}% | Time: {time.time()-t0:.2f}s\n")
-            
-    print_final_summary(summary_list)
-
-def print_final_summary(results: List[ExperimentResult]):
-    print("\n" + "="*80)
-    print(f"{'FINAL EXPERIMENT SUMMARY':^80}")
-    print("="*80)
-    
-    datasets = sorted(list(set(r.dataset_name for r in results)))
-    
-    header = f"{'Method':<15} |"
-    for ds in datasets:
-        header += f" {ds:^15} |"
-    header += f" {'AVG':^10}"
-    
-    print(header)
-    print("-" * len(header))
-    
-    for method, agg in METHOD_COMBINATIONS:
-        combo_name = f"{method} + {agg}"
-        row_str = f"{combo_name:<15} |"
-        
-        total_acc_sum = 0
-        count = 0
-        
-        for ds in datasets:
-            res = next((r for r in results if r.dataset_name == ds and r.method == method and r.agg == agg), None)
-            if res:
-                row_str += f" {res.accuracy:^14.2f}% |"
-                total_acc_sum += res.accuracy
-                count += 1
-            else:
-                row_str += f" {'N/A':^15} |"
-        
-        avg_acc = total_acc_sum / count if count > 0 else 0
-        row_str += f" {avg_acc:^9.2f}%"
-        print(row_str)
-        
-    print("="*80)
-    print("Note: Accuracy is averaged over all [Window x Percentile] grid points.")
-    print("Hit Criteria: Overlaps exactly 1 GT segment AND Template_Len <= 3 * Overlap_Len")

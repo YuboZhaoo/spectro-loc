@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import stft, get_window
@@ -14,7 +13,29 @@ def projection_api(
     cutoff: float = 1.0,           # STFT 保留频率的比例 (0~1]
     stft_onesided: bool = True,
 ) -> Dict[str, Any]:
-    
+    """Project a trace into a one-dimensional activity curve.
+
+    Parameters
+    ----------
+    trace:
+        Raw side-channel trace samples.
+    method:
+        ``"time"`` computes windowed time-domain energy. ``"stft"`` computes
+        low-frequency spectrogram energy.
+    agg:
+        ``"l1"`` sums magnitudes and ``"l2"`` sums squared magnitudes.
+    win_len, hop:
+        Sliding-window length and stride in samples.
+    cutoff:
+        Fraction of STFT frequency bins to retain, excluding the DC bin.
+
+    Returns
+    -------
+    dict
+        ``proj`` is the activity curve and ``t_frames`` are frame-center sample
+        indices. ``meta`` records the projection settings.
+    """
+
     trace = np.asarray(trace).reshape(-1).astype(np.float64)
 
     if method not in ("time", "stft"): raise ValueError("method error")
@@ -90,6 +111,8 @@ def projection_api(
 
 
 def apply_view_and_norm(t, y, view_range=None, normalize="zscore"):
+    """Optionally crop and normalize a projection curve."""
+
     if view_range is not None:
         a, b = view_range
         mask = (t >= a) & (t < b)
@@ -109,6 +132,8 @@ def apply_view_and_norm(t, y, view_range=None, normalize="zscore"):
 
 
 def plot_one(title, t, y):
+    """Plot a single normalized projection curve."""
+
     plt.figure(figsize=(12, 3))
     plt.plot(t, y, lw=1)
     plt.title(title)

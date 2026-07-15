@@ -3,30 +3,17 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from scipy import signal
 import os
-import sys
 from dataclasses import dataclass
 from typing import Tuple, Optional, List, Dict, Any
 
-sys.path.append(os.path.abspath(''))
-try:
-    from src.projection import projection_api, apply_view_and_norm
-except ImportError:
-    from .projection import projection_api, apply_view_and_norm
-
-@dataclass
-class DatasetConfig:
-    name: str
-    signal_path: str
-    trigger_path: str
-    fs: float
-    target_length: int
-    target_k: int
-    trigger_threshold_raw: float
-    noise_std: float = 0.0
+from .config import AutoDatasetConfig
+from .projection import projection_api, apply_view_and_norm
 
 @dataclass
 class AnalysisResult:
-    config: DatasetConfig
+    """Container for one automatic localization run."""
+
+    config: AutoDatasetConfig
     signal_data: np.ndarray
     trigger_data: Optional[np.ndarray]
     proj: Optional[np.ndarray] = None
@@ -44,7 +31,9 @@ class AnalysisResult:
     pred_peak_scores: Optional[np.ndarray] = None
     debug: Optional[Dict[str, Any]] = None
 
-def load_data(cfg: DatasetConfig, rng_seed: Optional[int] = 42) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def load_data(cfg: AutoDatasetConfig, rng_seed: Optional[int] = 42) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Load a trace, z-normalize it, and optionally add deterministic noise."""
+
     if not os.path.exists(cfg.signal_path):
         raise FileNotFoundError(cfg.signal_path)
     x = np.load(cfg.signal_path).astype(np.float64)
@@ -88,6 +77,8 @@ def _nms_pick_by_distance(sample_pos: np.ndarray, scores: np.ndarray, min_dist: 
     return np.array(kept, dtype=np.int64)
 
 def compute_projection_energy(x: np.ndarray, win_len: int) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Compute low-frequency STFT energy used by the automatic search."""
+
     hop = win_len - int(round(win_len * 0.25))
     proj_result = projection_api(
         trace=x,
@@ -103,6 +94,8 @@ def compute_projection_energy(x: np.ndarray, win_len: int) -> Tuple[np.ndarray, 
     return proj_z.astype(np.float32), t_frames, hop
 
 def select_seed_peaks_and_threshold(proj_z: np.ndarray, t_frames: np.ndarray, L: int, K: int, eps: float = 0.10) -> Tuple:
+    """Select high-energy seed peaks and the projection threshold."""
+
     M = (K + 1) // 2
     n_frames = proj_z.size
     m_cand = min(n_frames, max(2000, 20 * K))
@@ -132,6 +125,8 @@ def extract_fixed_length_segments_centered(x: np.ndarray, centers: np.ndarray, L
     return segs, spans
 
 def purify_template_from_segments(segs_z: List[np.ndarray], spans: List[Tuple[int, int]], keep_ratio: float = 0.6) -> Tuple:
+    """Build a robust template from mutually similar seed segments."""
+
     if not segs_z:
         return None, None, {}
     vecs = [_downsample_vector(s) for s in segs_z]
@@ -144,6 +139,8 @@ def purify_template_from_segments(segs_z: List[np.ndarray], spans: List[Tuple[in
     return tmpl.astype(np.float32), spans[medoid_i], {"N_seed": int(N), "medoid_i": int(medoid_i), "keep_n": int(keep_n)}
 
 def detect_topk_from_score(score: np.ndarray, L: int, K: int) -> Tuple:
+    """Pick the top non-overlapping template-match locations."""
+
     y = np.abs(score) if np.max(score) < 0.65 * np.max(np.abs(score)) else score
     nms_dist = int(0.8 * L)
     cand_size = min(y.size, K * 100)
@@ -158,7 +155,9 @@ def detect_topk_from_score(score: np.ndarray, L: int, K: int) -> Tuple:
     final = np.array(sorted(final), dtype=np.int64)
     return final, y[final].astype(np.float64), {"final_count": int(final.size)}
 
-def run_analysis(cfg: DatasetConfig, rng_seed: Optional[int] = 42) -> AnalysisResult:
+def run_analysis(cfg: AutoDatasetConfig, rng_seed: Optional[int] = 42) -> AnalysisResult:
+    """Run automatic repetitive-operation localization for one dataset."""
+
     x, trig = load_data(cfg, rng_seed=rng_seed)
     L, K = cfg.target_length, cfg.target_k
     win_cands = _window_candidates_from_target_length(L)
@@ -167,14 +166,20 @@ def run_analysis(cfg: DatasetConfig, rng_seed: Optional[int] = 42) -> AnalysisRe
     debug_best = None
     for win in win_cands:
         try:
+            # 1) Convert the trace into a spectrogram-projection energy curve.
             proj_z, t_frames, hop = compute_projection_energy(x, win)
+            # 2) Use strong projection peaks as provisional operation centers.
             seeds, thr, dbg_seed = select_seed_peaks_and_threshold(proj_z, t_frames, L, K)
             if seeds is None:
                 continue
+            # 3) Extract fixed-length segments and keep the most self-consistent
+            #    segment as the template for raw-signal matching.
             segs, spans = extract_fixed_length_segments_centered(x, seeds, L)
             tmpl, tmpl_span, dbg_pur = purify_template_from_segments(segs, spans)
             if tmpl is None:
                 continue
+            # 4) Match the purified template over the full trace and keep the
+            #    top-K non-overlapping peaks as localized operations.
             corr = signal.correlate(x, tmpl, mode="valid", method="fft")
             score = corr / (np.max(np.abs(corr)) + 1e-12)
             pred_peaks, pred_scores, dbg_pk = detect_topk_from_score(score, L, K)
@@ -212,6 +217,8 @@ def run_analysis(cfg: DatasetConfig, rng_seed: Optional[int] = 42) -> AnalysisRe
     )
 
 def evaluate_analysis(ar: AnalysisResult, tol_ratio: float = 0.00) -> Dict[str, Any]:
+    """Evaluate predicted intervals against trigger-derived ground truth."""
+
     if ar.trigger_data is None:
         return {"hit_rate": None, "reason": "no_trigger"}
     b = (ar.trigger_data > ar.config.trigger_threshold_raw).astype(np.int8)
@@ -223,6 +230,8 @@ def evaluate_analysis(ar: AnalysisResult, tol_ratio: float = 0.00) -> Dict[str, 
     hits, used = 0, np.zeros(len(pred), dtype=bool)
     for gs, ge in gt:
         for j, (ps, pe) in enumerate(pred):
+            # Count each prediction at most once; any interval overlap is a hit
+            # for the paper experiments, which use tol_ratio=0.
             if not used[j] and max(ps, gs - tol) < min(pe, ge + tol):
                 hits += 1
                 used[j] = True
@@ -238,6 +247,8 @@ def visualize_paper_overview(
     trigger_height_ratio: float = 0.20,
     trigger_baseline_ratio: float = 0.10
 ):
+    """Visualize projection seeds, template span, match score, and triggers."""
+
     cfg = ar.config
     N = ar.signal_data.size
     if view_range is None:
